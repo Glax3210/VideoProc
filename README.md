@@ -1,5 +1,4 @@
 
-```markdown
 # Video Processor GUI
 
 A modern, GPU-accelerated video compression tool built with Python. This application uses FFmpeg and NVENC to provide fast video processing with a smart resume feature.

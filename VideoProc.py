@@ -2,7 +2,7 @@
 Video Processor GUI Application
 GPU-accelerated video compression using FFmpeg and NVENC
 FIXED VERSION - Full GPU Utilization + Smart Resume
-"""
+"""   
 
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
@@ -96,6 +96,7 @@ class QueueStateManager:
                         "duration": vf.duration,
                         "bitrate": vf.bitrate,
                         "video_bitrate": vf.video_bitrate,
+                        "relative_path": vf.relative_path,  # NEW
                     }
                     for vf in queue
                 ]
@@ -137,6 +138,7 @@ class VideoFile:
         self.path = path
         self.filename = os.path.basename(path)
         self.directory = os.path.dirname(path)
+        self.relative_path = ""  # NEW: for preserving folder structure
         self.format = Path(path).suffix.upper().replace(".", "")
         self.size = 0
         self.duration = 0
@@ -233,11 +235,19 @@ class FFmpegProcessor:
         output_folder = self.config.get("output_folder")
         os.makedirs(output_folder, exist_ok=True)
         
-        # Generate output filename
+        # Generate output filename WITH FOLDER STRUCTURE
         suffix = self.config.get("filename_suffix")
         base_name = Path(video_file.filename).stem
         output_name = f"{base_name}{suffix}.mp4"
-        output_path = os.path.join(output_folder, output_name)
+        
+        # NEW: If relative_path exists, preserve folder structure
+        if video_file.relative_path and video_file.relative_path != ".":
+            output_dir = os.path.join(output_folder, video_file.relative_path)
+            os.makedirs(output_dir, exist_ok=True)
+            output_path = os.path.join(output_dir, output_name)
+        else:
+            output_path = os.path.join(output_folder, output_name)
+        
         video_file.output_path = output_path
         
         # Calculate target bitrate
@@ -1077,10 +1087,14 @@ class VideoProcessorApp(ctk.CTk):
             video_file.duration = f.get("duration", 0)
             video_file.bitrate = f.get("bitrate", 0)
             video_file.video_bitrate = f.get("video_bitrate", 0)
+            video_file.relative_path = f.get("relative_path", "")  # NEW
             
-            # Check if output exists
+            # Check if output exists (considering folder structure)
             base_name = Path(path).stem
-            output_path = os.path.join(output_folder, f"{base_name}{suffix}.mp4")
+            if video_file.relative_path and video_file.relative_path != ".":
+                output_path = os.path.join(output_folder, video_file.relative_path, f"{base_name}{suffix}.mp4")
+            else:
+                output_path = os.path.join(output_folder, f"{base_name}{suffix}.mp4")
             
             if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
                 video_file.status = "completed"
@@ -1337,23 +1351,56 @@ class VideoProcessorApp(ctk.CTk):
             self.add_to_queue(files)
     
     def add_folder(self):
-        """Add all videos from a folder"""
+        """Add all videos from a folder - preserves folder structure"""
         folder = filedialog.askdirectory()
         if not folder:
             return
         
         extensions = {'.mp4', '.mkv', '.mov', '.avi', '.wmv', '.flv', '.webm'}
-        files = []
+        files_with_paths = []
+        
+        # Get the parent of selected folder to include folder name in structure
+        base_folder_parent = os.path.dirname(folder)
         
         for root, dirs, filenames in os.walk(folder):
             for f in filenames:
                 if Path(f).suffix.lower() in extensions:
-                    files.append(os.path.join(root, f))
+                    full_path = os.path.join(root, f)
+                    # Calculate relative path INCLUDING the selected folder name
+                    rel_dir = os.path.relpath(root, base_folder_parent)
+                    files_with_paths.append((full_path, rel_dir))
         
-        if files:
-            self.add_to_queue(files)
+        if files_with_paths:
+            self.add_to_queue_with_structure(files_with_paths)
         else:
             messagebox.showinfo("Info", "No video files found")
+    
+    def add_to_queue_with_structure(self, files_with_paths):
+        """Add files to queue with folder structure information"""
+        processor = FFmpegProcessor(self.config, self.console.log)
+        
+        for path, rel_path in files_with_paths:
+            if path in [vf.path for vf in self.queue]:
+                continue
+            
+            video_file = VideoFile(path)
+            video_file.relative_path = rel_path  # Store the relative path
+            
+            info = processor.get_video_info(path)
+            if info:
+                video_file.size = info["size"]
+                video_file.duration = info["duration"]
+                video_file.bitrate = info["bitrate"]
+                video_file.video_bitrate = info["video_bitrate"]
+            else:
+                video_file.status = "error"
+                video_file.error = "Could not read file info"
+            
+            self.queue.append(video_file)
+            self.add_queue_item(video_file)
+        
+        self.update_stats()
+        self.console.log("INFO", f"Added {len(files_with_paths)} file(s) with folder structure")
     
     def add_to_queue(self, file_paths):
         processor = FFmpegProcessor(self.config, self.console.log)
@@ -1430,7 +1477,12 @@ class VideoProcessorApp(ctk.CTk):
         
         for vf in self.queue:
             base_name = Path(vf.path).stem
-            output_path = os.path.join(output_folder, f"{base_name}{suffix}.mp4")
+            
+            # NEW: Consider folder structure
+            if vf.relative_path and vf.relative_path != ".":
+                output_path = os.path.join(output_folder, vf.relative_path, f"{base_name}{suffix}.mp4")
+            else:
+                output_path = os.path.join(output_folder, f"{base_name}{suffix}.mp4")
             
             if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
                 if vf.status != "completed":
@@ -1496,9 +1548,13 @@ class VideoProcessorApp(ctk.CTk):
         
         for vf in self.queue:
             if vf.status == "pending":
-                # Check if output already exists
                 base_name = Path(vf.path).stem
-                output_path = os.path.join(output_folder, f"{base_name}{suffix}.mp4")
+                
+                # NEW: Consider folder structure when checking output
+                if vf.relative_path and vf.relative_path != ".":
+                    output_path = os.path.join(output_folder, vf.relative_path, f"{base_name}{suffix}.mp4")
+                else:
+                    output_path = os.path.join(output_folder, f"{base_name}{suffix}.mp4")
                 
                 if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
                     vf.status = "completed"

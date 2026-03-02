@@ -2,6 +2,7 @@
 Video Processor GUI Application
 GPU-accelerated video compression using FFmpeg and NVENC
 INCLUDES - Full GPU Utilization + Smart Resume + Auto-Dependency + Auto-Update
+IMPROVEMENTS - Optimized Progress, Temp Cleanup, Security Check, Disk Space Validation, Conflict Handling, Persistent Logs, Safe Termination
 """   
 
 import customtkinter as ctk
@@ -18,14 +19,15 @@ import time
 import shutil
 import urllib.request
 import zipfile
+import hashlib
 from pathlib import Path
 from datetime import datetime
 
 # ============================================
 # Application Constants & Environment
 # ============================================
-APP_VERSION = "v2.6.0"
-GITHUB_REPO = "Glax3210/VideoProc"  # TODO: Change to your actual GitHub Repo
+APP_VERSION = "v1.0.0"
+GITHUB_REPO = "Glax3210/VideoProc"
 
 # Set up local app data paths for isolated dependency management
 LOCAL_APP_DATA = Path(os.environ.get('LOCALAPPDATA', Path.home() / 'AppData' / 'Local'))
@@ -33,6 +35,7 @@ APP_DIR = LOCAL_APP_DATA / "VideoProc"
 FFMPEG_DIR = APP_DIR / "ffmpeg"
 DEFAULT_FFMPEG = str(FFMPEG_DIR / "ffmpeg.exe")
 DEFAULT_FFPROBE = str(FFMPEG_DIR / "ffprobe.exe")
+ERROR_LOG_FILE = str(APP_DIR / "error.log")
 
 CONFIG_FILE = str(APP_DIR / "video_processor_config.json")
 QUEUE_STATE_FILE = str(APP_DIR / "video_processor_queue.json")
@@ -59,6 +62,7 @@ DEFAULT_CONFIG = {
     "copy_audio": True,
     "audio_bitrate": "128k",
     "max_concurrent_jobs": 1,
+    "conflict_resolution": "skip" # skip, overwrite, auto_rename
 }
 
 class Config:
@@ -141,7 +145,6 @@ class DependencyManager:
                         with open(target_path, "wb") as target:
                             shutil.copyfileobj(source, target)
                             
-            # Clean up zip (ignore winerror 32)
             try: os.remove(zip_path)
             except Exception: pass
             
@@ -172,17 +175,42 @@ class AutoUpdater:
             with urllib.request.urlopen(req, timeout=5) as response:
                 data = json.loads(response.read().decode())
                 latest_tag = data.get("tag_name", "v0.0.0")
+                
+                self.log("INFO", f"Local version: {APP_VERSION} | GitHub version: {latest_tag}")
+                
                 if self.parse_version(latest_tag) > self.parse_version(APP_VERSION):
+                    self.log("INFO", "Newer version found! Finding .exe download link...")
                     assets = data.get("assets", [])
                     exe_asset = next((a for a in assets if a["name"].endswith(".exe")), None)
-                    if exe_asset: return exe_asset["browser_download_url"], latest_tag
+                    if exe_asset: 
+                        return exe_asset["browser_download_url"], latest_tag, assets
+                    else:
+                        self.log("ERROR", "Found newer version, but no .exe was found in GitHub assets!")
+                else:
+                    self.log("INFO", "App is already up to date.")
+                    
         except Exception as e:
-            self.log("WARN", f"Could not check for updates: {e}")
+            self.log("ERROR", f"GitHub API check failed: {e}")
         return None
-
-    def download_and_update(self, download_url, version_tag, progress_callback=None):
+    
+    def download_and_update(self, download_url, version_tag, progress_callback=None, assets=None):
         try:
             self.log("INFO", f"Downloading update {version_tag}...")
+            
+            # Fetch SHA256 Hash if available to prevent corrupted or tampered updates
+            sha256_hash = None
+            if assets:
+                hash_asset = next((a for a in assets if "sha256" in a["name"].lower() or "checksum" in a["name"].lower()), None)
+                if hash_asset:
+                    try:
+                        req = urllib.request.Request(hash_asset["browser_download_url"], headers={'User-Agent': 'Mozilla/5.0'})
+                        with urllib.request.urlopen(req, timeout=5) as response:
+                            hash_content = response.read().decode('utf-8')
+                            sha256_hash = hash_content.split()[0].strip()
+                            self.log("INFO", f"Retrieved SHA256 checksum for verification.")
+                    except Exception:
+                        pass
+            
             current_exe = sys.executable
             update_exe = str(APP_DIR / "update_downloaded.exe")
             with urllib.request.urlopen(download_url) as response, open(update_exe, 'wb') as out_file:
@@ -196,12 +224,46 @@ class AutoUpdater:
                     downloaded += len(buffer)
                     if total_length and progress_callback: progress_callback(int((downloaded / total_length) * 100))
             
+            # Security Check 1: MZ Header Verification (Valid Windows Executable)
+            with open(update_exe, 'rb') as f:
+                if f.read(2) != b'MZ':
+                    raise ValueError("Downloaded file is not a valid Windows executable (corrupted download).")
+            
+            # Security Check 2: Hash Verification
+            if sha256_hash:
+                with open(update_exe, 'rb') as f:
+                    file_hash = hashlib.sha256(f.read()).hexdigest()
+                if file_hash.lower() != sha256_hash.lower():
+                    raise ValueError("SHA256 checksum mismatch! Update file may be tampered or corrupted.")
+                self.log("INFO", "Checksum verified successfully!")
+
             bat_path = str(APP_DIR / "updater.bat")
-            bat_content = f"""@echo off\ntimeout /t 2 /nobreak > NUL\nmove /y "{update_exe}" "{current_exe}"\nstart "" "{current_exe}"\ndel "%~f0"\n"""
+            bat_content = f"""@echo off
+set _MEIPASS=
+set _MEIPASS2=
+set _PYI_VIRTUAL_SOURCE=
+set loopcount=0
+:retry
+ping 127.0.0.1 -n 2 > nul
+set /a loopcount=loopcount+1
+if %loopcount%==15 goto launch
+move /y "{update_exe}" "{current_exe}"
+if errorlevel 1 goto retry
+
+:launch
+start "" "{current_exe}"
+del "%~f0"
+"""
             with open(bat_path, "w") as b: b.write(bat_content)
             self.log("INFO", "Update ready! Restarting application...")
-            subprocess.Popen([bat_path], creationflags=subprocess.CREATE_NO_WINDOW)
-            sys.exit(0)
+            
+            env = os.environ.copy()
+            keys_to_remove =[k for k in env if k.upper().startswith('_MEI') or k.upper().startswith('_PYI')]
+            for k in keys_to_remove: env.pop(k, None)
+            
+            subprocess.Popen(["cmd.exe", "/c", bat_path], creationflags=subprocess.CREATE_NO_WINDOW, env=env)
+            os._exit(0)
+            
         except Exception as e:
             self.log("ERROR", f"Update failed: {e}")
 
@@ -214,7 +276,7 @@ class QueueStateManager:
     
     def save(self, queue):
         try:
-            data = {"timestamp": datetime.now().isoformat(), "files": [{"path": vf.path, "status": vf.status, "size": vf.size, "duration": vf.duration, "bitrate": vf.bitrate, "video_bitrate": vf.video_bitrate, "relative_path": vf.relative_path} for vf in queue]}
+            data = {"timestamp": datetime.now().isoformat(), "files":[{"path": vf.path, "status": vf.status, "size": vf.size, "duration": vf.duration, "bitrate": vf.bitrate, "video_bitrate": vf.video_bitrate, "relative_path": vf.relative_path} for vf in queue]}
             with open(self.state_file, 'w') as f: json.dump(data, f, indent=2)
         except Exception as e: print(f"Error saving queue: {e}")
     
@@ -262,15 +324,23 @@ class FFmpegProcessor:
     
     def log(self, level, message):
         if self.log_callback: self.log_callback(level, message)
-    
+        
+    def log_error_to_file(self, video_file, error_msg, return_code=None):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        rc_str = f" [Code: {return_code}]" if return_code is not None else ""
+        try:
+            with open(ERROR_LOG_FILE, 'a', encoding='utf-8') as f:
+                f.write(f"[{timestamp}] FILE: {video_file.filename} | ERROR: {error_msg}{rc_str}\n")
+        except Exception: pass
+
     def get_video_info(self, file_path):
         ffprobe_path = self.config.get("ffprobe_path")
-        cmd = [ffprobe_path, "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", file_path]
+        cmd =[ffprobe_path, "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", file_path]
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
             if result.returncode == 0:
                 info = json.loads(result.stdout)
-                video_stream = next((s for s in info.get("streams", []) if s.get("codec_type") == "video"), None)
+                video_stream = next((s for s in info.get("streams",[]) if s.get("codec_type") == "video"), None)
                 format_info = info.get("format", {})
                 return {"duration": float(format_info.get("duration", 0)), "size": int(format_info.get("size", 0)), "bitrate": int(format_info.get("bit_rate", 0)), "video_bitrate": int(video_stream.get("bit_rate", 0)) if video_stream else 0, "width": video_stream.get("width", 0) if video_stream else 0, "height": video_stream.get("height", 0) if video_stream else 0, "codec": video_stream.get("codec_name", "unknown") if video_stream else "unknown"}
         except Exception as e:
@@ -298,19 +368,45 @@ class FFmpegProcessor:
         suffix = self.config.get("filename_suffix")
         base_name = Path(video_file.filename).stem
         output_name = f"{base_name}{suffix}.mp4"
+        conflict_action = self.config.get("conflict_resolution")
         
-        if video_file.relative_path and video_file.relative_path != ".":
-            output_dir = os.path.join(output_folder, video_file.relative_path)
-            os.makedirs(output_dir, exist_ok=True)
-            output_path = os.path.join(output_dir, output_name)
-        else: output_path = os.path.join(output_folder, output_name)
+        output_dir = os.path.join(output_folder, video_file.relative_path) if video_file.relative_path and video_file.relative_path != "." else output_folder
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, output_name)
         
+        # Check Disk Space before processing
+        try:
+            free_space = shutil.disk_usage(output_folder).free
+            target_bitrate = self.calculate_target_bitrate(video_file)
+            expected_size = max(video_file.size * 0.1, target_bitrate * 1024 / 8 * video_file.duration)
+            if free_space < expected_size + (200 * 1024 * 1024):  # Require minimum 200MB buffer
+                self.log("ERROR", f"Low disk space! Skipping {video_file.filename}")
+                self.log_error_to_file(video_file, "Insufficient disk space on target drive")
+                video_file.status, video_file.error = "error", "Low disk space"
+                return False
+        except Exception: pass
+        
+        # Conflict Handling
+        if os.path.exists(output_path):
+            if conflict_action == "skip":
+                self.log("INFO", f"Skipping existing file: {output_name}")
+                video_file.status, video_file.progress = "completed", 100
+                video_file.output_path = output_path
+                return True
+            elif conflict_action == "auto_rename":
+                counter = 1
+                while os.path.exists(output_path):
+                    output_name = f"{base_name}{suffix}_{counter}.mp4"
+                    output_path = os.path.join(output_dir, output_name)
+                    counter += 1
+            # "overwrite" will naturally be handled by FFmpeg's -y flag
+            
         video_file.output_path = output_path
         target_bitrate = self.calculate_target_bitrate(video_file)
         source_bitrate = (video_file.video_bitrate or video_file.bitrate) // 1000
         self.log("INFO", f"Bitrate: {source_bitrate} kbps → {target_bitrate} kbps")
         
-        progress_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt')
+        progress_file = tempfile.NamedTemporaryFile(mode='w', delete=False, prefix='videoproc_prog_', suffix='.txt')
         progress_file.close()
         self.progress_file = progress_file.name
         
@@ -331,7 +427,8 @@ class FFmpegProcessor:
             duration = video_file.duration
             while self.current_process.poll() is None:
                 if self.is_cancelled:
-                    self.current_process.terminate()
+                    self.current_process.kill() # Ensure termination
+                    self.current_process.wait(timeout=2)
                     self.cleanup_progress_file()
                     return False
                 progress = self.read_progress_file(duration)
@@ -344,26 +441,35 @@ class FFmpegProcessor:
                 video_file.status, video_file.progress = "completed", 100
                 if os.path.exists(output_path):
                     output_size = os.path.getsize(output_path)
-                    reduction = int((1 - output_size / video_file.size) * 100)
+                    reduction = int((1 - output_size / max(video_file.size, 1)) * 100)
                     self.log("DONE", f"Completed: {video_file.filename} (Saved {reduction}%)")
                 self.cleanup_progress_file()
                 return True
             else:
                 video_file.status, video_file.error = "error", f"FFmpeg exited with code {return_code}"
                 self.log("ERROR", f"FFmpeg failed with code: {return_code}")
+                self.log_error_to_file(video_file, "FFmpeg processing failure", return_code)
                 self.cleanup_progress_file()
                 return False
         except Exception as e:
             video_file.status, video_file.error = "error", str(e)
             self.log("ERROR", f"Process error: {e}")
+            self.log_error_to_file(video_file, str(e))
             self.cleanup_progress_file()
             return False
-        finally: self.current_process = None
+        finally: 
+            self.current_process = None
     
     def read_progress_file(self, duration):
         try:
             if not os.path.exists(self.progress_file): return 0
-            with open(self.progress_file, 'r') as f: content = f.read()
+            file_size = os.path.getsize(self.progress_file)
+            seek_pos = max(0, file_size - 2048) # Read only last ~2KB for performance
+            
+            with open(self.progress_file, 'r') as f:
+                f.seek(seek_pos)
+                content = f.read()
+                
             matches = re.findall(r'out_time_ms=(\d+)', content)
             if matches:
                 time_ms = int(matches[-1])
@@ -379,13 +485,18 @@ class FFmpegProcessor:
     
     def cleanup_progress_file(self):
         try:
-            if self.progress_file and os.path.exists(self.progress_file): os.remove(self.progress_file)
+            if self.progress_file and os.path.exists(self.progress_file): 
+                os.remove(self.progress_file)
         except Exception: pass
         self.progress_file = None
     
     def cancel(self):
         self.is_cancelled = True
-        if self.current_process: self.current_process.terminate()
+        if self.current_process: 
+            try:
+                self.current_process.kill()
+                self.current_process.wait(timeout=3)
+            except Exception: pass
         self.cleanup_progress_file()
 
 # ============================================
@@ -469,7 +580,7 @@ class LogConsole(ctk.CTkFrame):
         self.log_text.configure(state="disabled")
 
 # ============================================
-# ORIGINAL BEAUTIFUL SETTINGS MENU
+# Settings Menu
 # ============================================
 class SettingsPanel(ctk.CTkToplevel):
     def __init__(self, parent, config, on_save=None):
@@ -505,7 +616,12 @@ class SettingsPanel(ctk.CTkToplevel):
         ctk.CTkLabel(suffix_frame, text="Filename Suffix", text_color="#92a4c9").pack(anchor="w")
         self.suffix_entry = ctk.CTkEntry(suffix_frame, width=200, fg_color="#0d121c", border_color="#324467")
         self.suffix_entry.pack(anchor="w", pady=5)
-        ctk.CTkLabel(suffix_frame, text="Example: video_compressed.mp4", text_color="#586a8a", font=("Arial", 10)).pack(anchor="w")
+        
+        conflict_frame = ctk.CTkFrame(storage_frame, fg_color="transparent")
+        conflict_frame.pack(fill="x", padx=15, pady=10)
+        ctk.CTkLabel(conflict_frame, text="File Conflict Action", text_color="#92a4c9").pack(anchor="w")
+        self.conflict_combo = ctk.CTkComboBox(conflict_frame, values=["skip", "overwrite", "auto_rename"], width=200, fg_color="#0d121c", border_color="#324467", button_color="#324467", dropdown_fg_color="#111722")
+        self.conflict_combo.pack(anchor="w", pady=5)
         
         self.create_path_input(storage_frame, "FFmpeg Path", "ffmpeg_path", is_folder=False)
         self.create_path_input(storage_frame, "FFprobe Path", "ffprobe_path", is_folder=False)
@@ -570,7 +686,6 @@ class SettingsPanel(ctk.CTkToplevel):
         self.size_btn = ctk.CTkButton(mode_frame, text="Target Size", width=100, height=28, fg_color="transparent", hover_color="#232f48", command=lambda: self.set_bitrate_mode("target_size"))
         self.size_btn.pack(side="left", padx=2, pady=2)
         
-        # Percentage Area
         self.pct_frame = ctk.CTkFrame(bitrate_frame, fg_color="transparent")
         self.pct_frame.pack(fill="x", pady=10)
         pct_header = ctk.CTkFrame(self.pct_frame, fg_color="transparent")
@@ -586,7 +701,6 @@ class SettingsPanel(ctk.CTkToplevel):
         ctk.CTkLabel(pct_labels, text="33% (1/3)", text_color="#586a8a", font=("Arial", 9)).pack(side="left", expand=True)
         ctk.CTkLabel(pct_labels, text="100%", text_color="#586a8a", font=("Arial", 9)).pack(side="right")
         
-        # Size Area
         self.size_frame = ctk.CTkFrame(bitrate_frame, fg_color="transparent")
         size_header = ctk.CTkFrame(self.size_frame, fg_color="transparent")
         size_header.pack(fill="x")
@@ -667,6 +781,7 @@ class SettingsPanel(ctk.CTkToplevel):
         self.ffmpeg_path_entry.insert(0, self.config.get("ffmpeg_path"))
         self.ffprobe_path_entry.delete(0, "end")
         self.ffprobe_path_entry.insert(0, self.config.get("ffprobe_path"))
+        self.conflict_combo.set(self.config.get("conflict_resolution"))
         if self.config.get("gpu_acceleration"): self.gpu_switch.select()
         else: self.gpu_switch.deselect()
         if self.config.get("hardware_decode"): self.hwdec_switch.select()
@@ -695,6 +810,7 @@ class SettingsPanel(ctk.CTkToplevel):
         self.config.set("filename_suffix", self.suffix_entry.get())
         self.config.set("ffmpeg_path", self.ffmpeg_path_entry.get())
         self.config.set("ffprobe_path", self.ffprobe_path_entry.get())
+        self.config.set("conflict_resolution", self.conflict_combo.get())
         self.config.set("gpu_acceleration", self.gpu_switch.get())
         self.config.set("hardware_decode", self.hwdec_switch.get())
         
@@ -734,7 +850,7 @@ class VideoProcessorApp(ctk.CTk):
         self.configure(fg_color="#0d121c")
         
         self.config = Config()
-        self.queue = []
+        self.queue =[]
         self.queue_items = {}
         self.is_processing = False
         self.processor = None
@@ -743,23 +859,38 @@ class VideoProcessorApp(ctk.CTk):
         self.ui_locked = False
         
         self.protocol("WM_DELETE_WINDOW", self.on_close)
-        atexit.register(self.save_queue_on_exit)
+        atexit.register(self.force_cleanup)
         
         self.create_widgets()
         threading.Thread(target=self.startup_sequence, daemon=True).start()
 
+    def force_cleanup(self):
+        if self.processor:
+            self.processor.cancel()
+        if self.queue: 
+            self.queue_state.save(self.queue)
+
     def startup_sequence(self):
         self.after(0, lambda: self.set_ui_state("locked"))
+        
+        # Clean up old temp progress files
+        try:
+            temp_dir = tempfile.gettempdir()
+            for f in os.listdir(temp_dir):
+                if f.startswith("videoproc_prog_") and f.endswith(".txt"):
+                    os.remove(os.path.join(temp_dir, f))
+        except Exception: pass
+        
         self.after(0, lambda: self.console.log("INFO", f"Checking GitHub ({GITHUB_REPO}) for updates..."))
         updater = AutoUpdater(lambda l, m: self.after(0, lambda: self.console.log(l, m)))
         update_data = updater.check_for_updates()
         
         if update_data:
-            dl_url, tag = update_data
+            dl_url, tag, assets = update_data
             self.after(0, lambda: self.status_label.configure(text=f"Status: Downloading Update {tag}..."))
             def update_prog(pct):
                 self.after(0, lambda: self.overall_progress.set(pct/100))
-            updater.download_and_update(dl_url, tag, update_prog)
+            updater.download_and_update(dl_url, tag, update_prog, assets)
             return 
         
         self.after(0, lambda: self.console.log("INFO", "Validating FFmpeg installation..."))
@@ -788,17 +919,19 @@ class VideoProcessorApp(ctk.CTk):
             self.clear_btn.configure(state="normal")
             self.status_label.configure(text="Status: Idle")
             self.overall_progress.set(0)
-
-    def save_queue_on_exit(self):
-        if self.queue: self.queue_state.save(self.queue)
     
     def on_close(self):
         if self.is_processing:
             if messagebox.askyesno("Confirm", "Processing in progress. Stop and save queue?"):
                 self.stop_processing()
                 self.queue_state.save(self.queue)
+            else:
+                return # User cancelled closure
         elif self.queue:
             self.queue_state.save(self.queue)
+            
+        if self.processor: 
+            self.processor.cancel()
         self.destroy()
     
     def check_resume(self):
@@ -806,7 +939,7 @@ class VideoProcessorApp(ctk.CTk):
         data = self.queue_state.load()
         if not data or not data.get("files"): return
         files = data["files"]
-        incomplete = [f for f in files if f["status"] != "completed"]
+        incomplete =[f for f in files if f["status"] != "completed"]
         if not incomplete:
             self.queue_state.clear()
             return
@@ -881,12 +1014,12 @@ class VideoProcessorApp(ctk.CTk):
         logo_frame = ctk.CTkFrame(sidebar, fg_color="transparent")
         logo_frame.pack(fill="x", padx=20, pady=20)
         ctk.CTkLabel(logo_frame, text="🎬 VideoProc", font=("Arial", 20, "bold"), text_color="white").pack(anchor="w")
-        ctk.CTkLabel(logo_frame, text=f"{APP_VERSION} • Full GPU + Auto Updater", font=("Arial", 10), text_color="#92a4c9").pack(anchor="w")
+        ctk.CTkLabel(logo_frame, text=f"{APP_VERSION} • Full GPU ", font=("Arial", 10), text_color="#92a4c9").pack(anchor="w")
         
         nav_frame = ctk.CTkFrame(sidebar, fg_color="transparent")
         nav_frame.pack(fill="x", padx=15, pady=10)
         
-        nav_buttons = [
+        nav_buttons =[
             ("🎵", "Processing Queue", lambda: None, True),
             ("📂", "Output Folder", self.open_output_folder, False),
             ("🔄", "Rescan Missing", self.rescan_queue, False),
@@ -934,7 +1067,7 @@ class VideoProcessorApp(ctk.CTk):
         stats_frame = ctk.CTkFrame(parent, fg_color="transparent")
         stats_frame.pack(fill="x", padx=20, pady=15)
         
-        stats = [("📁", "Total Files", "stat_total", "0"), ("💾", "Total Size", "stat_size", "0 MB"), ("⏳", "Pending", "stat_pending", "0"), ("✅", "Completed", "stat_completed", "0")]
+        stats =[("📁", "Total Files", "stat_total", "0"), ("💾", "Total Size", "stat_size", "0 MB"), ("⏳", "Pending", "stat_pending", "0"), ("✅", "Completed", "stat_completed", "0")]
         
         for icon, title, attr, default in stats:
             card = ctk.CTkFrame(stats_frame, fg_color="#111722", corner_radius=10)
@@ -956,7 +1089,7 @@ class VideoProcessorApp(ctk.CTk):
         folder = filedialog.askdirectory()
         if not folder: return
         extensions = {'.mp4', '.mkv', '.mov', '.avi', '.wmv', '.flv', '.webm'}
-        files_with_paths = []
+        files_with_paths =[]
         base_folder_parent = os.path.dirname(folder)
         for root, dirs, filenames in os.walk(folder):
             for f in filenames:
@@ -988,7 +1121,7 @@ class VideoProcessorApp(ctk.CTk):
     def add_to_queue(self, file_paths):
         processor = FFmpegProcessor(self.config, self.console.log)
         for path in file_paths:
-            if path in [vf.path for vf in self.queue]: continue
+            if path in[vf.path for vf in self.queue]: continue
             video_file = VideoFile(path)
             info = processor.get_video_info(path)
             if info:
@@ -1015,7 +1148,7 @@ class VideoProcessorApp(ctk.CTk):
         if not self.queue: self.empty_state.pack(fill="both", expand=True, pady=50)
     
     def clear_queue(self):
-        for vf in [vf for vf in self.queue if vf.status != "processing"]: self.remove_from_queue(vf)
+        for vf in[vf for vf in self.queue if vf.status != "processing"]: self.remove_from_queue(vf)
         self.queue_state.clear()
         self.console.log("INFO", "Queue cleared")
     
@@ -1044,22 +1177,22 @@ class VideoProcessorApp(ctk.CTk):
     
     def start_processing(self):
         if self.ui_locked: return
-        ffmpeg_path = self.config.get("ffmpeg_path")
-        if not os.path.exists(ffmpeg_path):
-            return messagebox.showerror("Error", f"FFmpeg not found:\n{ffmpeg_path}\n\nAuto-installer failed or missing.")
         output_folder = self.config.get("output_folder")
         try: os.makedirs(output_folder, exist_ok=True)
         except Exception as e: return messagebox.showerror("Error", f"Cannot create output folder:\n{e}")
         
         suffix = self.config.get("filename_suffix")
+        conflict_action = self.config.get("conflict_resolution")
         skipped = 0
+        
         for vf in self.queue:
             if vf.status == "pending":
                 base_name = Path(vf.path).stem
                 output_path = os.path.join(output_folder, vf.relative_path, f"{base_name}{suffix}.mp4") if vf.relative_path and vf.relative_path != "." else os.path.join(output_folder, f"{base_name}{suffix}.mp4")
                 if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-                    vf.status, vf.progress, vf.output_path, skipped = "completed", 100, output_path, skipped + 1
-                    if vf in self.queue_items: self.queue_items[vf].update_display()
+                    if conflict_action == "skip":
+                        vf.status, vf.progress, vf.output_path, skipped = "completed", 100, output_path, skipped + 1
+                        if vf in self.queue_items: self.queue_items[vf].update_display()
                 elif not os.path.exists(vf.path):
                     vf.status, vf.error = "error", "File not found"
                     if vf in self.queue_items: self.queue_items[vf].update_display()
@@ -1079,6 +1212,16 @@ class VideoProcessorApp(ctk.CTk):
         self.processing_thread.start()
     
     def process_queue(self):
+        dep_manager = DependencyManager(self.config, log_callback=lambda l, m: self.after(0, lambda: self.console.log(l, m)))
+        if not dep_manager.validate_installation():
+            self.after(0, lambda: self.console.log("WARN", "FFmpeg missing before processing! Reinstalling..."))
+            success = dep_manager.install_ffmpeg(lambda pct: self.after(0, lambda: self.overall_progress.set(pct/100)))
+            if not success:
+                self.after(0, lambda: messagebox.showerror("Error", "FFmpeg re-installation failed."))
+                self.is_processing = False
+                self.after(0, self.update_processing_ui)
+                return
+
         self.processor = FFmpegProcessor(self.config, log_callback=lambda l, m: self.after(0, lambda: self.console.log(l, m)), progress_callback=self.on_progress_update)
         for video_file in self.queue:
             if not self.is_processing: break
